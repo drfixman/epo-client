@@ -1,6 +1,6 @@
 [package]
 name = "epo-client"
-version = "0.0.1"
+version = "0.0.2"
 edition = "2024"
 publish = true
 description = "Async client for the EPO Open Patent Services (OPS) v3.2 REST API: OAuth2, biblio/family/citations/search, CQL syntax validator."

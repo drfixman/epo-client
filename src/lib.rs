@@ -374,6 +374,10 @@ pub struct EpoClient {
     pacer_search: Arc<EndpointPacer>,
     pacer_retrieval: Arc<EndpointPacer>,
     pacer_other: Arc<EndpointPacer>,
+    /// Bounds in-flight requests across every endpoint. Built from
+    /// [`ClientConfig::max_concurrent`]; the per-endpoint pacers run beneath
+    /// it so a small permit count + tight pacers compose without conflict.
+    sem: Arc<tokio::sync::Semaphore>,
 }
 
 /// Tunables for [`EpoClient`]. Use [`ClientConfig::default`] for sensible
@@ -412,6 +416,14 @@ pub struct ClientConfig {
     /// Soft warning threshold for weekly bytes used (`x-registeredquotaperweek-used`).
     /// Logs a `warn!` when crossed. Default: 75% of 4 GB free-tier ceiling.
     pub weekly_warn_bytes: u64,
+    /// Maximum in-flight requests across every endpoint. Acquired at the
+    /// entry of each public `fetch_*` method via an internal semaphore,
+    /// so callers don't have to wrap calls in their own concurrency
+    /// guard. Composes with the per-endpoint pacers: e.g. `max_concurrent =
+    /// 8` lets up to 8 requests overlap, each still waiting on its
+    /// endpoint pacer before firing. `0` is clamped to `1` at construction
+    /// (a zero-permit semaphore would deadlock the first call). Default: 8.
+    pub max_concurrent: usize,
 }
 
 /// Overall server load reported in `x-throttling-control`.
@@ -664,6 +676,10 @@ impl Default for ClientConfig {
             other_interval: Duration::from_millis(60),
             // 75% of 4 GB free-tier weekly ceiling.
             weekly_warn_bytes: (4u64 * 1024 * 1024 * 1024) * 3 / 4,
+            // 8 in-flight requests is the sweet spot for the free-tier
+            // pacers: enough overlap that I/O dominates, not so many that
+            // the pacers serialise into a single-file queue.
+            max_concurrent: 8,
         }
     }
 }
@@ -761,6 +777,8 @@ impl EpoClient {
         let pacer_search = Arc::new(EndpointPacer::new(config.search_interval));
         let pacer_retrieval = Arc::new(EndpointPacer::new(config.retrieval_interval));
         let pacer_other = Arc::new(EndpointPacer::new(config.other_interval));
+        // Zero-permit semaphore would deadlock the first `acquire`; clamp.
+        let sem = Arc::new(tokio::sync::Semaphore::new(config.max_concurrent.max(1)));
         Self {
             http: reqwest::Client::new(),
             consumer_key,
@@ -772,6 +790,7 @@ impl EpoClient {
             pacer_search,
             pacer_retrieval,
             pacer_other,
+            sem,
         }
     }
 
@@ -881,6 +900,7 @@ impl EpoClient {
 
     #[instrument(skip(self), fields(endpoint = "biblio", attempts = field::Empty))]
     pub async fn fetch_biblio(&self, patent_id: &str) -> Result<PatentBiblio, EpoError> {
+        let _permit = self.sem.acquire().await.expect("EPO semaphore poisoned");
         retry_with_pacer(
             &self.pacer_inpadoc,
             &self.config.retry_backoff,
@@ -949,6 +969,7 @@ impl EpoClient {
         &self,
         patent_id: &str,
     ) -> Result<(PatentBiblio, Citations), EpoError> {
+        let _permit = self.sem.acquire().await.expect("EPO semaphore poisoned");
         let json = retry_with_pacer(
             &self.pacer_inpadoc,
             &self.config.retry_backoff,
@@ -969,6 +990,7 @@ impl EpoClient {
 
     #[instrument(skip(self), fields(endpoint = "citations", attempts = field::Empty))]
     pub async fn fetch_citations(&self, patent_id: &str) -> Result<Citations, EpoError> {
+        let _permit = self.sem.acquire().await.expect("EPO semaphore poisoned");
         let json = retry_with_pacer(
             &self.pacer_inpadoc,
             &self.config.retry_backoff,
@@ -996,6 +1018,7 @@ impl EpoClient {
         range_begin: u32,
         range_end: u32,
     ) -> Result<SearchResults, EpoError> {
+        let _permit = self.sem.acquire().await.expect("EPO semaphore poisoned");
         let val = retry_with_pacer(
             &self.pacer_search,
             &self.config.retry_backoff,
@@ -1064,6 +1087,7 @@ impl EpoClient {
 
     #[instrument(skip(self), fields(endpoint = "family", attempts = field::Empty))]
     pub async fn fetch_family(&self, patent_id: &str) -> Result<Vec<FamilyMember>, EpoError> {
+        let _permit = self.sem.acquire().await.expect("EPO semaphore poisoned");
         retry_with_pacer(
             &self.pacer_inpadoc,
             &self.config.retry_backoff,
@@ -1129,6 +1153,7 @@ impl EpoClient {
     /// retry-on-403/429 schedule.
     #[instrument(skip(self), fields(endpoint = "description", attempts = field::Empty))]
     pub async fn fetch_description(&self, patent_id: &str) -> Result<PatentDescription, EpoError> {
+        let _permit = self.sem.acquire().await.expect("EPO semaphore poisoned");
         retry_with_pacer(
             &self.pacer_retrieval,
             &self.config.retry_backoff,
@@ -1187,6 +1212,7 @@ impl EpoClient {
     /// JSON yourself.
     #[instrument(skip(self), fields(endpoint = "claims", attempts = field::Empty))]
     pub async fn fetch_claims(&self, patent_id: &str) -> Result<PatentClaims, EpoError> {
+        let _permit = self.sem.acquire().await.expect("EPO semaphore poisoned");
         retry_with_pacer(
             &self.pacer_retrieval,
             &self.config.retry_backoff,
