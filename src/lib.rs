@@ -43,8 +43,9 @@
 //! - [`EpoClient::fetch_citations`] — backward citations from the biblio endpoint.
 //! - [`EpoClient::fetch_citing`] — forward citations via CQL search.
 //! - [`EpoClient::fetch_search`] — CQL search with pagination.
+//! - [`EpoClient::fetch_cpc_titles`] — CPC scheme titles for a list of codes, one request per code.
 //!
-//! All four return typed [`EpoError`] variants on failure, with retry built in
+//! All of them return typed [`EpoError`] variants on failure, with retry built in
 //! for `403`/`429`. The token endpoint response is cached and refreshed
 //! automatically when it nears expiry.
 //!
@@ -1318,6 +1319,208 @@ impl EpoClient {
         }
         filled
     }
+
+    /// Fetch the CPC scheme titles of `symbols`, one
+    /// `GET /classification/cpc/{symbol}?ancestors` request per symbol.
+    /// A title that continues its parent's title gets the parent's title
+    /// in front (see [`parse_cpc_titles`]).
+    /// Returns symbol → title for each symbol the scheme knows, the key
+    /// normalized by [`normalize_cpc_symbol`]. A symbol EPO does not know,
+    /// a symbol with characters other than `A-Z`, `0-9` and `/`, and a
+    /// symbol whose request fails are absent. An auth failure or an
+    /// exhausted rate limit ends the call with that error. An empty list
+    /// sends nothing.
+    #[instrument(skip(self, symbols), fields(
+        endpoint = "classification",
+        requested = symbols.len(),
+        found = field::Empty,
+        http_status = field::Empty,
+        attempts = field::Empty,
+    ))]
+    pub async fn fetch_cpc_titles(
+        &self,
+        symbols: &[&str],
+    ) -> Result<std::collections::HashMap<String, String>, EpoError> {
+        let wanted: Vec<String> = symbols
+            .iter()
+            .map(|s| normalize_cpc_symbol(s))
+            .filter(|s| is_cpc_symbol(s))
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+        let mut titles = std::collections::HashMap::new();
+        for symbol in wanted {
+            let _permit = self.sem.acquire().await.expect("EPO semaphore poisoned");
+            let fetched = retry_with_pacer(
+                &self.pacer_other,
+                &self.config.retry_backoff,
+                &symbol,
+                "classification",
+                || self.fetch_cpc_title_once(&symbol),
+            )
+            .await;
+            match fetched {
+                Ok(xml) => {
+                    if let Some(title) = parse_cpc_titles(&xml).remove(&symbol) {
+                        titles.insert(symbol, title);
+                    }
+                }
+                Err(e @ (EpoError::Auth(_) | EpoError::RateLimit)) => return Err(e),
+                Err(e) => {
+                    warn!(symbol, error = %e, "fetch_cpc_titles: symbol fetch failed");
+                }
+            }
+        }
+        Span::current().record("found", titles.len());
+        Ok(titles)
+    }
+
+    async fn fetch_cpc_title_once(&self, symbol: &str) -> Result<String, EpoError> {
+        let token = self.get_token().await?;
+        let url = format!(
+            "{}/rest-services/classification/cpc/{symbol}?ancestors",
+            self.config.base_url
+        );
+        let resp = self
+            .http
+            .get(&url)
+            .header("Accept", "application/cpc+xml")
+            .bearer_auth(&token)
+            .send()
+            .await
+            .map_err(|e| EpoError::Network(e.to_string()))?;
+
+        let status = resp.status().as_u16();
+        Span::current().record("http_status", status);
+        self.update_throttling(resp.headers());
+
+        match status {
+            200 => {}
+            404 => return Ok(String::new()),
+            403 | 429 => return Err(EpoError::RateLimit),
+            other => {
+                let body = resp.text().await.unwrap_or_default();
+                return Err(EpoError::Api(format!("{other}: {body}")));
+            }
+        }
+
+        let xml = resp
+            .text()
+            .await
+            .map_err(|e| EpoError::Api(e.to_string()))?;
+        let doc = roxmltree::Document::parse(&xml)
+            .map_err(|e| EpoError::Api(format!("{status}: answer is not XML: {e}")))?;
+        if let Some(message) = ops_error_message(&doc) {
+            return Err(EpoError::Api(format!("{status}: {message}")));
+        }
+        Ok(xml)
+    }
+}
+
+/// Whether `symbol` (normalized) has the form of a CPC symbol: a section
+/// letter, then only `A-Z`, `0-9` and `/`, so it is safe as URL path
+/// segments.
+fn is_cpc_symbol(symbol: &str) -> bool {
+    symbol.starts_with(|c: char| c.is_ascii_uppercase())
+        && symbol
+            .chars()
+            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '/')
+}
+
+/// Every `cpc:classification-item` in a CPC retrieval answer (XML), at any
+/// depth (an item nests its children), as symbol → title. A title is its
+/// `title-part` texts joined with "; ". A title that starts in lower case
+/// continues the title of the item above it (H01M10/659 "by heat storage
+/// or buffering, …"), so it gets that title in front. The items above come
+/// before the item in the answer, each with a lower `level`. Items without
+/// a symbol or title are skipped; text that is not XML gives no titles.
+pub fn parse_cpc_titles(xml: &str) -> std::collections::HashMap<String, String> {
+    let mut titles = std::collections::HashMap::new();
+    let Ok(doc) = roxmltree::Document::parse(xml) else {
+        return titles;
+    };
+    // The items above the current one, as (level, full title).
+    let mut above: Vec<(u32, String)> = Vec::new();
+    for item in doc
+        .descendants()
+        .filter(|n| n.tag_name().name() == "classification-item")
+    {
+        let level = item
+            .attribute("level")
+            .and_then(|l| l.parse().ok())
+            .unwrap_or(0);
+        while above.last().is_some_and(|(l, _)| *l >= level) {
+            above.pop();
+        }
+
+        let symbol = xml_child(item, "classification-symbol")
+            .map(|n| normalize_cpc_symbol(&xml_text(n)))
+            .unwrap_or_default();
+        let mut title = xml_child(item, "class-title")
+            .map(cpc_title)
+            .unwrap_or_default();
+        if title.starts_with(char::is_lowercase)
+            && let Some((_, parent)) = above.last()
+        {
+            title = format!("{parent} {title}");
+        }
+        if title.is_empty() {
+            continue;
+        }
+
+        above.push((level, title.clone()));
+        if !symbol.is_empty() {
+            titles.entry(symbol).or_insert(title);
+        }
+    }
+    titles
+}
+
+/// The `message` of an OPS `<error>` answer; `None` for any other answer.
+fn ops_error_message(doc: &roxmltree::Document) -> Option<String> {
+    let root = doc.root_element();
+    if root.tag_name().name() != "error" {
+        return None;
+    }
+    Some(xml_child(root, "message").map(xml_text).unwrap_or_default())
+}
+
+/// A `class-title`'s `title-part` texts joined with "; ".
+fn cpc_title(class_title: roxmltree::Node) -> String {
+    class_title
+        .children()
+        .filter(|n| n.tag_name().name() == "title-part")
+        .flat_map(|part| part.children().filter(|n| n.tag_name().name() == "text"))
+        .map(|text| xml_text(text).trim().to_string())
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// The first child element of `node` with the local name `name`.
+fn xml_child<'a, 'input>(
+    node: roxmltree::Node<'a, 'input>,
+    name: &str,
+) -> Option<roxmltree::Node<'a, 'input>> {
+    node.children().find(|n| n.tag_name().name() == name)
+}
+
+/// All text inside `node`, inline elements included.
+fn xml_text(node: roxmltree::Node) -> String {
+    node.descendants()
+        .filter(|n| n.is_text())
+        .filter_map(|n| n.text())
+        .collect()
+}
+
+/// A CPC symbol as the classification service names it: no spaces,
+/// upper case (`"h01m 10/6556"` → `"H01M10/6556"`).
+pub fn normalize_cpc_symbol(symbol: &str) -> String {
+    symbol
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect::<String>()
+        .to_uppercase()
 }
 
 /// Extract bibliographic data from EPO JSON response.
@@ -2150,6 +2353,134 @@ pub fn parse_family(json: &serde_json::Value) -> Vec<FamilyMember> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The shape of the guide's CPC retrieval example (§3.6.1, "children one
+    /// level below classification A"): items nest their children, a title
+    /// has several parts.
+    #[test]
+    fn cpc_titles_read_every_nested_item() {
+        let xml = r#"<ops:world-patent-data xmlns:ops="http://ops.epo.org"
+            xmlns:xlink="http://www.w3.org/1999/xlink"
+            xmlns:cpc="http://www.epo.org/cpcexport">
+          <ops:classification-scheme><ops:cpc>
+            <cpc:class-scheme scheme-type="cpc" export-date="2012-10-13">
+              <cpc:classification-item level="4" sort-key="A01">
+                <cpc:classification-symbol>A01</cpc:classification-symbol>
+                <cpc:class-title date-revised="2012-10-12">
+                  <cpc:title-part><cpc:text scheme="ipc">AGRICULTURE</cpc:text></cpc:title-part>
+                  <cpc:title-part><cpc:text scheme="ipc"> FORESTRY</cpc:text></cpc:title-part>
+                </cpc:class-title>
+                <cpc:classification-item level="5" sort-key="A01B">
+                  <cpc:classification-symbol>A01 B</cpc:classification-symbol>
+                  <cpc:class-title><cpc:title-part><cpc:text scheme="ipc">SOIL WORKING</cpc:text></cpc:title-part></cpc:class-title>
+                </cpc:classification-item>
+                <cpc:classification-item level="5" sort-key="A01C">
+                  <cpc:classification-symbol>A01C</cpc:classification-symbol>
+                </cpc:classification-item>
+              </cpc:classification-item>
+            </cpc:class-scheme>
+          </ops:cpc></ops:classification-scheme>
+        </ops:world-patent-data>"#;
+        let titles = parse_cpc_titles(xml);
+        assert_eq!(
+            titles.get("A01").map(String::as_str),
+            Some("AGRICULTURE; FORESTRY")
+        );
+        assert_eq!(titles.get("A01B").map(String::as_str), Some("SOIL WORKING"));
+        assert!(!titles.contains_key("A01C"), "no title, no entry");
+        assert!(parse_cpc_titles("").is_empty());
+    }
+
+    /// A title in lower case continues the title above it, whether the
+    /// ancestors come nested or listed before the item.
+    #[test]
+    fn cpc_titles_continue_the_title_above() {
+        let nested = r#"<ops:world-patent-data xmlns:ops="http://ops.epo.org"
+            xmlns:cpc="http://www.epo.org/cpcexport">
+          <ops:classification-scheme><ops:cpc><cpc:class-scheme scheme-type="cpc">
+            <cpc:classification-item level="7">
+              <cpc:classification-symbol>H01M10/60</cpc:classification-symbol>
+              <cpc:class-title><cpc:title-part><cpc:text>Heating or cooling</cpc:text></cpc:title-part></cpc:class-title>
+              <cpc:classification-item level="8">
+                <cpc:classification-symbol>H01M10/65</cpc:classification-symbol>
+                <cpc:class-title><cpc:title-part><cpc:text>Means for temperature control structurally associated with the cells</cpc:text></cpc:title-part></cpc:class-title>
+                <cpc:classification-item level="9">
+                  <cpc:classification-symbol>H01M10/659</cpc:classification-symbol>
+                  <cpc:class-title><cpc:title-part><cpc:text>by heat storage or buffering</cpc:text></cpc:title-part></cpc:class-title>
+                </cpc:classification-item>
+              </cpc:classification-item>
+            </cpc:classification-item>
+          </cpc:class-scheme></ops:cpc></ops:classification-scheme>
+        </ops:world-patent-data>"#;
+        let flat = r#"<ops:world-patent-data xmlns:ops="http://ops.epo.org"
+            xmlns:cpc="http://www.epo.org/cpcexport">
+          <ops:classification-scheme><ops:cpc><cpc:class-scheme scheme-type="cpc">
+            <cpc:classification-item level="7">
+              <cpc:classification-symbol>H01M10/60</cpc:classification-symbol>
+              <cpc:class-title><cpc:title-part><cpc:text>Heating or cooling</cpc:text></cpc:title-part></cpc:class-title>
+            </cpc:classification-item>
+            <cpc:classification-item level="8">
+              <cpc:classification-symbol>H01M10/65</cpc:classification-symbol>
+              <cpc:class-title><cpc:title-part><cpc:text>Means for temperature control structurally associated with the cells</cpc:text></cpc:title-part></cpc:class-title>
+            </cpc:classification-item>
+            <cpc:classification-item level="9">
+              <cpc:classification-symbol>H01M10/659</cpc:classification-symbol>
+              <cpc:class-title><cpc:title-part><cpc:text>by heat storage or buffering</cpc:text></cpc:title-part></cpc:class-title>
+            </cpc:classification-item>
+            <cpc:classification-item level="8">
+              <cpc:classification-symbol>H01M10/66</cpc:classification-symbol>
+              <cpc:class-title><cpc:title-part><cpc:text>characterised by the heat-exchange means</cpc:text></cpc:title-part></cpc:class-title>
+            </cpc:classification-item>
+          </cpc:class-scheme></ops:cpc></ops:classification-scheme>
+        </ops:world-patent-data>"#;
+        let full = "Means for temperature control structurally associated with the cells by heat storage or buffering";
+        assert_eq!(parse_cpc_titles(nested)["H01M10/659"], full);
+        assert_eq!(parse_cpc_titles(flat)["H01M10/659"], full);
+        assert_eq!(
+            parse_cpc_titles(flat)["H01M10/66"],
+            "Heating or cooling characterised by the heat-exchange means",
+            "a sibling continues its own parent, not the item before it"
+        );
+        assert_eq!(
+            parse_cpc_titles(nested)["H01M10/65"],
+            "Means for temperature control structurally associated with the cells"
+        );
+    }
+
+    /// The guide's error answer (§2.3, "Error conditions") is read as an
+    /// error; a scheme answer is not.
+    #[test]
+    fn ops_error_answer_gives_its_message() {
+        let error = roxmltree::Document::parse(
+            "<error><code>403</code><message>This request has been rejected</message></error>",
+        )
+        .unwrap();
+        assert_eq!(
+            ops_error_message(&error).as_deref(),
+            Some("This request has been rejected")
+        );
+        let scheme =
+            roxmltree::Document::parse("<ops:world-patent-data xmlns:ops=\"http://ops.epo.org\"/>")
+                .unwrap();
+        assert_eq!(ops_error_message(&scheme), None);
+    }
+
+    #[test]
+    fn cpc_symbols_compare_without_spaces_or_case() {
+        assert_eq!(normalize_cpc_symbol(" h01m 10/6556 "), "H01M10/6556");
+    }
+
+    #[test]
+    fn only_cpc_characters_reach_the_url() {
+        assert!(is_cpc_symbol("H01M10/6556"));
+        assert!(is_cpc_symbol("A01B"));
+        assert!(!is_cpc_symbol(""));
+        assert!(!is_cpc_symbol("/A01B"));
+        assert!(!is_cpc_symbol("A01B/../../published-data"));
+        assert!(!is_cpc_symbol("A01B?depth=all"));
+        assert!(!is_cpc_symbol("A01B#x"));
+        assert!(!is_cpc_symbol("A01B%2F00"));
+    }
 
     #[test]
     fn test_parse_family_empty() {

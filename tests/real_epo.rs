@@ -9,8 +9,8 @@
 //! minimal so one weird patent doesn't hide later ones.
 
 use epo::{
-    EpoClient, EpoError, parse_biblio, parse_citations, parse_family, parse_search_results,
-    validate_cql,
+    EpoClient, EpoError, parse_biblio, parse_citations, parse_cpc_titles, parse_family,
+    parse_search_results, validate_cql,
 };
 use tracing_subscriber::EnvFilter;
 
@@ -529,4 +529,47 @@ async fn not_found_real() {
         Err(other) => panic!("expected EpoError::NotFound, got: {other:?}"),
         Ok(b) => panic!("expected NotFound for bogus ID, got biblio: {b:?}"),
     }
+}
+
+/// The CPC retrieval service, in the form the OPS 3.2 reference guide
+/// documents (§3.6.1): one symbol per request,
+/// `GET /classification/cpc/{symbol}?ancestors` with
+/// `Accept: application/cpc+xml`. H01M10/659's own title starts with
+/// "by heat storage …", so its full title needs the ancestors.
+#[tokio::test]
+#[ignore]
+async fn cpc_titles_real() {
+    init_tracing();
+    let (key, secret) = env_creds();
+    let http = reqwest::Client::new();
+    let token = auth(&http, &key, &secret).await;
+    let url = format!("{BASE}/rest-services/classification/cpc/H01M10/659?ancestors");
+    let resp = http
+        .get(&url)
+        .header("Accept", "application/cpc+xml")
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("HTTP request failed");
+    let status = resp.status();
+    let xml = resp.text().await.expect("body should read");
+    eprintln!(
+        "\n=== cpc_titles_real (raw EPO response) ===\nurl: {url}\nstatus: {status}\nbody:\n{xml}\n"
+    );
+    dump_parsed(
+        "cpc_titles_real (parse_cpc_titles)",
+        &parse_cpc_titles(&xml),
+    );
+
+    let client = EpoClient::new(key, secret, None);
+    let titles = client
+        .fetch_cpc_titles(&["H01M10/6556", "H01M10/659"])
+        .await
+        .expect("fetch_cpc_titles");
+    dump_parsed("cpc_titles_real (fetch_cpc_titles)", &titles);
+    assert!(titles.contains_key("H01M10/6556"), "{titles:?}");
+    assert!(
+        titles["H01M10/659"].starts_with(char::is_uppercase),
+        "the parent's title comes first: {titles:?}"
+    );
 }
