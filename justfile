@@ -13,11 +13,12 @@ test:
 test-live:
     cargo test --test real_epo -- --ignored --test-threads=1 --nocapture
 
-# Pre-PR gate: fmt + clippy + tests.
+# Pre-PR gate: fmt + clippy + tests + the fuzz targets compile.
 check:
     cargo fmt --check
     cargo clippy --all-targets -- -D warnings
     cargo test
+    cargo check --manifest-path fuzz/Cargo.toml
 
 # Fuzz a target for `seconds` (default 60). e.g. `just fuzz fuzz_cql_validate 300`. Needs nightly.
 fuzz target seconds="60":

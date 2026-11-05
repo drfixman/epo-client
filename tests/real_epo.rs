@@ -1,7 +1,7 @@
 //! Live EPO OPS integration tests — hit https://ops.epo.org/3.2 directly.
 //!
 //! All tests are #[ignore]'d. Run with:
-//!   cargo test -p epo --test real_epo -- --ignored --test-threads=1 --nocapture
+//!   cargo test --test real_epo -- --ignored --test-threads=1 --nocapture
 //! Requires EPO_CONSUMER_KEY and EPO_CONSUMER_SECRET in the environment.
 //!
 //! Each test prints both the raw EPO JSON response and the parsed struct so
@@ -9,8 +9,8 @@
 //! minimal so one weird patent doesn't hide later ones.
 
 use epo::{
-    EpoClient, EpoError, parse_biblio, parse_citations, parse_cpc_titles, parse_family,
-    parse_search_results, validate_cql,
+    EpoClient, EpoError, IMAGE_FORMATS, parse_biblio, parse_citations, parse_cpc_titles,
+    parse_family, parse_image_inquiry, parse_search_results, validate_cql,
 };
 use tracing_subscriber::EnvFilter;
 
@@ -572,4 +572,177 @@ async fn cpc_titles_real() {
         titles["H01M10/659"].starts_with(char::is_uppercase),
         "the parent's title comes first: {titles:?}"
     );
+}
+
+/// Publications for the image tests: a 2000 grant and a 2016 one.
+const IMAGE_PATENTS: &[&str] = &[TEST_PATENT, "EP3000000"];
+
+/// The images inquiry. Prints the raw XML next to `parse_image_inquiry`'s
+/// result, so the hand-written fixture in the unit tests can be checked
+/// against the wire shape. An unknown publication must give `NotFound`.
+#[tokio::test]
+#[ignore]
+async fn image_inquiry_real() {
+    init_tracing();
+    let (key, secret) = env_creds();
+    let http = reqwest::Client::new();
+    let token = auth(&http, &key, &secret).await;
+    let client = EpoClient::new(key, secret, None);
+
+    for patent_id in IMAGE_PATENTS {
+        let url =
+            format!("{BASE}/rest-services/published-data/publication/epodoc/{patent_id}/images");
+        let resp = http
+            .get(&url)
+            .header("Accept", "application/xml")
+            .bearer_auth(&token)
+            .send()
+            .await
+            .expect("HTTP request failed");
+        let status = resp.status();
+        let xml = resp.text().await.expect("body should read");
+        eprintln!(
+            "\n=== image_inquiry_real ({patent_id}) (raw EPO response) ===\nurl: {url}\nstatus: {status}\nbody:\n{xml}\n"
+        );
+        dump_parsed(
+            &format!("image_inquiry_real ({patent_id}) (parse_image_inquiry)"),
+            &parse_image_inquiry(&xml),
+        );
+
+        let instances = client
+            .fetch_image_inquiry(patent_id)
+            .await
+            .expect("fetch_image_inquiry");
+        dump_parsed(
+            &format!("image_inquiry_real ({patent_id}) (fetch_image_inquiry)"),
+            &instances,
+        );
+        assert!(!instances.is_empty(), "{patent_id} has images");
+        for i in &instances {
+            assert!(i.page_count > 0, "{patent_id}: {i:?}");
+            assert!(i.link.is_some(), "{patent_id}: {i:?}");
+            assert!(!i.formats.is_empty(), "{patent_id}: {i:?}");
+        }
+        assert!(
+            instances
+                .iter()
+                .any(|i| i.sections.iter().any(|s| s.name == "DRAWINGS")),
+            "{patent_id} has a DRAWINGS section"
+        );
+    }
+    eprintln!(
+        "images quota left: {:?}",
+        client.throttling_state().and_then(|t| t.images_remaining())
+    );
+
+    let missing = client.fetch_image_inquiry("ZZ99999999").await;
+    eprintln!("\n=== image_inquiry_real (ZZ99999999) ===\n{missing:#?}\n");
+    assert!(
+        matches!(missing, Err(EpoError::NotFound)),
+        "expected NotFound, got {missing:?}"
+    );
+}
+
+/// The first drawing page of every instance with a DRAWINGS section, in
+/// every format the inquiry lists. Each page is written to
+/// `target/tmp/epo-images/` (the path is printed) so you can open it and
+/// see what EPO sent. The bytes must start with the signature of the
+/// content type EPO named.
+#[tokio::test]
+#[ignore]
+async fn image_pages_real() {
+    init_tracing();
+    let (key, secret) = env_creds();
+    let client = EpoClient::new(key, secret, None);
+    let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("epo-images");
+    std::fs::create_dir_all(&dir).expect("create the output folder");
+
+    let mut failures: Vec<String> = Vec::new();
+    for patent_id in IMAGE_PATENTS {
+        let instances = client
+            .fetch_image_inquiry(patent_id)
+            .await
+            .expect("fetch_image_inquiry");
+        for instance in &instances {
+            let Some(drawings) = instance.sections.iter().find(|s| s.name == "DRAWINGS") else {
+                continue;
+            };
+            let link = instance.link.as_deref().expect("instance link");
+            // One file per link: a publication's A1 and B1 both have a
+            // "Drawing" instance, so the kind alone would collide.
+            let stem = link
+                .trim_start_matches("published-data/images/")
+                .replace('/', "-");
+            for format in &instance.formats {
+                let label = format!(
+                    "{patent_id} {} ({link}) page {} as {format}",
+                    instance.kind, drawings.start_page
+                );
+                if !IMAGE_FORMATS.contains(&format.as_str()) {
+                    failures.push(format!("{label}: format not in IMAGE_FORMATS"));
+                    continue;
+                }
+                let page = match client
+                    .fetch_image_page(link, format, drawings.start_page, Some(instance.page_count))
+                    .await
+                {
+                    Ok(page) => page,
+                    Err(e) => {
+                        failures.push(format!("{label}: {e:?}"));
+                        continue;
+                    }
+                };
+                let file = dir.join(format!(
+                    "{stem}-p{}.{}",
+                    drawings.start_page,
+                    extension(&page.content_type)
+                ));
+                std::fs::write(&file, &page.bytes).expect("write the page");
+                eprintln!(
+                    "{label}: {} bytes, content type {}, saved to {}",
+                    page.bytes.len(),
+                    page.content_type,
+                    file.display()
+                );
+                if !signature_matches(&page.content_type, &page.bytes) {
+                    failures.push(format!(
+                        "{label}: bytes do not start like {}: {:02x?}",
+                        page.content_type,
+                        &page.bytes[..page.bytes.len().min(8)]
+                    ));
+                }
+            }
+        }
+    }
+    eprintln!(
+        "images quota left: {:?}",
+        client.throttling_state().and_then(|t| t.images_remaining())
+    );
+    assert!(
+        failures.is_empty(),
+        "image pages:\n  - {}",
+        failures.join("\n  - ")
+    );
+}
+
+/// File extension for a content type EPO sends.
+fn extension(content_type: &str) -> &'static str {
+    match content_type.split(';').next().unwrap_or("").trim() {
+        "application/pdf" => "pdf",
+        "application/tiff" | "image/tiff" => "tif",
+        "image/png" => "png",
+        "image/jpeg" => "jpg",
+        _ => "bin",
+    }
+}
+
+/// True when `bytes` start with the file signature of `content_type`.
+fn signature_matches(content_type: &str, bytes: &[u8]) -> bool {
+    match extension(content_type) {
+        "pdf" => bytes.starts_with(b"%PDF"),
+        "tif" => bytes.starts_with(b"II*\0") || bytes.starts_with(b"MM\0*"),
+        "png" => bytes.starts_with(b"\x89PNG"),
+        "jpg" => bytes.starts_with(b"\xff\xd8\xff"),
+        _ => false,
+    }
 }

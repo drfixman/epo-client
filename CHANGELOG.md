@@ -4,6 +4,28 @@ All notable changes to this crate are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning follows
 [Semantic Versioning](https://semver.org/).
 
+## [0.0.4] - 2026-11-04
+
+- `fetch_image_inquiry`: list a publication's image instances (full
+  document, drawings, first-page clipping, …) with their page counts,
+  formats, links and sections, so you can find the first drawing page.
+  `parse_image_inquiry` reads the same XML answer.
+- `fetch_image_page`: fetch one page of an image instance as raw bytes in
+  a format the inquiry lists (PDF or TIFF; first-page clippings also PNG
+  or JPEG), with the content type EPO sent. Only links the
+  inquiry returns, formats OPS offers and pages in range are sent; bodies
+  are capped at `MAX_IMAGE_BYTES` (16 MiB).
+- `ThrottlingState::images_remaining` reads the `images` quota.
+- Every call that takes a publication number refuses one that is not
+  letters and digits (`EpoError::InvalidRequest`) before any request is
+  sent, so a caller's input can never change the path or the query.
+- `EpoClient` is `Clone`: clones share the token, the pacers and the
+  in-flight cap.
+- A transport failure on the token request is `EpoError::Network`, as on
+  every other request; `Auth` now means rejected credentials only.
+- `validate_cql` reports positions as char offsets for non-ASCII queries
+  too; before, a term like `Wärme` before a quote shifted the quote check.
+
 ## [0.0.3] - 2026-10-18
 
 - `fetch_cpc_titles`: CPC scheme titles for a list of codes, one
@@ -38,6 +60,7 @@ Initial public release.
 - Typed `EpoError`: `Auth` / `NotFound` / `RateLimit` / `Api(status, body)` /
   `Network`.
 
+[0.0.4]: https://github.com/drfixman/epo-client/releases/tag/v0.0.4
 [0.0.3]: https://github.com/drfixman/epo-client/releases/tag/v0.0.3
 [0.0.2]: https://github.com/drfixman/epo-client/releases/tag/v0.0.2
 [0.0.1]: https://github.com/drfixman/epo-client/releases/tag/v0.0.1

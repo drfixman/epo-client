@@ -33,24 +33,36 @@ const BOOLEAN_OPS: &[&str] = &["AND", "OR", "NOT"];
 const WITHIN_OP: &str = "within";
 
 /// CQL validation errors. `position` is the 0-based char offset into
-/// the input where the problem was first detected.
+/// the trimmed input where the problem was first detected.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct CqlError {
+    /// 0-based char offset (not byte offset) into the trimmed query.
     pub position: usize,
+    /// What was wrong there.
     pub kind: CqlErrorKind,
 }
 
+/// The kinds of [`CqlError`]. The `String` payloads carry the offending
+/// token as written in the query.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum CqlErrorKind {
+    /// The query is empty or whitespace only.
     Empty,
+    /// A `(` without its `)`, or a `)` without its `(`.
     UnbalancedParen,
+    /// A `"` that is never closed.
     UnbalancedQuote,
+    /// A `code=` prefix whose code is not in [`FIELD_CODES`].
     UnknownFieldCode(String),
+    /// A field code followed by a comparator but no value.
     EmptyFieldValue(String),
+    /// `NEAR/` without a number after the slash.
     BadProximity(String),
+    /// `AND`/`OR`/`NOT` at the end of the query.
     DanglingOperator(String),
+    /// `AND`/`OR`/`NOT` at the start of the query.
     LeadingOperator(String),
 }
 
@@ -104,7 +116,10 @@ impl std::error::Error for CqlError {}
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct ValidatedCql {
+    /// The input, trimmed.
     pub query: String,
+    /// `(code, value)` for every `code<comparator>value` outside quotes, in
+    /// query order; the code lower-cased, the value without its quotes.
     pub fields: Vec<(String, String)>,
 }
 
@@ -119,18 +134,22 @@ pub fn validate(input: &str) -> Result<ValidatedCql, CqlError> {
         });
     }
 
+    // Every offset below is a char index into `trimmed` (what
+    // `CqlError.position` promises), never a byte index: a non-ASCII
+    // term before a quote must not shift the quote's position.
+    let chars: Vec<char> = trimmed.chars().collect();
+
     // Pass 1: structural — parens + quotes balanced; capture quoted
     // ranges so passes 2 + 3 can skip operator/field detection inside
     // string literals.
-    let bytes = trimmed.as_bytes();
     let mut paren_depth = 0i32;
     let mut paren_open_at = 0usize;
     let mut in_quote = false;
     let mut quote_open_at = 0usize;
     let mut quoted_ranges: Vec<(usize, usize)> = Vec::new();
-    for (i, &b) in bytes.iter().enumerate() {
-        match b {
-            b'"' => {
+    for (i, &c) in chars.iter().enumerate() {
+        match c {
+            '"' => {
                 if in_quote {
                     quoted_ranges.push((quote_open_at, i));
                     in_quote = false;
@@ -139,13 +158,13 @@ pub fn validate(input: &str) -> Result<ValidatedCql, CqlError> {
                     in_quote = true;
                 }
             }
-            b'(' if !in_quote => {
+            '(' if !in_quote => {
                 if paren_depth == 0 {
                     paren_open_at = i;
                 }
                 paren_depth += 1;
             }
-            b')' if !in_quote => {
+            ')' if !in_quote => {
                 paren_depth -= 1;
                 if paren_depth < 0 {
                     return Err(CqlError {
@@ -176,7 +195,6 @@ pub fn validate(input: &str) -> Result<ValidatedCql, CqlError> {
     // `code<` outside quotes must be a known field, and have a non-empty
     // value before the next operator/paren.
     let mut fields: Vec<(String, String)> = Vec::new();
-    let chars: Vec<char> = trimmed.chars().collect();
     let mut i = 0;
     while i < chars.len() {
         if !chars[i].is_ascii_alphabetic() || in_quote_at(i) {
@@ -284,7 +302,7 @@ pub fn validate(input: &str) -> Result<ValidatedCql, CqlError> {
         }
         if token_lc.ends_with(&format!(" {op}")) || token_lc.ends_with(&format!(" {op})")) {
             return Err(CqlError {
-                position: trimmed.len() - op.len(),
+                position: chars.len() - op.len(),
                 kind: CqlErrorKind::DanglingOperator((*op).to_string()),
             });
         }
@@ -508,6 +526,26 @@ mod tests {
         // No comparator detected → pd treated as bare word, no fields.
         let r = validate(q).expect("malformed but parser-tolerant");
         assert!(r.fields.is_empty());
+    }
+
+    #[test]
+    fn non_ascii_terms_do_not_shift_quote_positions() {
+        // "ä" is two bytes: with byte offsets the quote around Wärme ends
+        // one char early and `pa=` reads as inside the quote.
+        let v = validate(r#"ta="Wärme" AND pa="Siemens""#).unwrap();
+        assert_eq!(
+            v.fields,
+            vec![
+                ("ta".to_string(), "Wärme".to_string()),
+                ("pa".to_string(), "Siemens".to_string())
+            ]
+        );
+        let err = validate(r#"ta="Wärme AND pa=Siemens"#).unwrap_err();
+        assert_eq!(err.kind, CqlErrorKind::UnbalancedQuote);
+        assert_eq!(err.position, 3, "a char offset, not a byte offset");
+        let err = validate("ta=Wärme AND").unwrap_err();
+        assert_eq!(err.kind, CqlErrorKind::DanglingOperator("AND".into()));
+        assert_eq!(err.position, 9);
     }
 
     #[test]
