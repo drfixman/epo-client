@@ -1,11 +1,12 @@
 //! Mock-HTTP unit tests for `EpoClient`. Cover OAuth2 caching/refresh, error
-//! mapping (Auth / NotFound / RateLimit / Api), retry-then-success, and
-//! bearer-token forwarding — all without hitting real EPO.
+//! mapping (Auth / NotFound / RateLimit / Api / InvalidRequest),
+//! retry-then-success, and bearer-token forwarding — all without hitting
+//! real EPO.
 //!
 //! Tokio runtime runs paused so the client's built-in 250ms / 500ms / …
 //! backoff sleeps complete instantly. wiremock matchers verify request shape.
 
-use epo::{ClientConfig, EpoClient, EpoError, FamilyMember, ThrottlingColor};
+use epo::{ClientConfig, EpoClient, EpoError, FamilyMember, MAX_IMAGE_BYTES, ThrottlingColor};
 use serde_json::json;
 use std::time::Duration;
 use wiremock::matchers::{header, method, path, query_param};
@@ -792,4 +793,201 @@ async fn fetch_cpc_titles_404_and_empty_list_return_nothing() {
         c.fetch_cpc_titles(&[]).await.unwrap().is_empty(),
         "no request"
     );
+}
+
+/// OPS's images inquiry answer for EP1000000, recorded 2026-11-05.
+const IMAGE_INQUIRY_XML: &str = include_str!("fixtures/images_ep1000000.xml");
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn fetch_image_inquiry_parses_instances_and_reports_images_quota() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ok_token("1200"))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(
+            "/rest-services/published-data/publication/epodoc/EP1000000/images",
+        ))
+        .and(header("accept", "application/xml"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(IMAGE_INQUIRY_XML)
+                .insert_header(
+                    "x-throttling-control",
+                    "idle (images=yellow:7, inpadoc=green:45, retrieval=green:100)",
+                ),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let c = EpoClient::new(KEY.into(), SECRET.into(), Some(server.uri()));
+    let instances = c.fetch_image_inquiry("EP1000000").await.unwrap();
+    assert_eq!(instances.len(), 6);
+    assert_eq!(instances[0].kind, "FullDocument");
+    assert_eq!(instances[0].page_count, 11);
+    assert_eq!(instances[0].sections[3].name, "DRAWINGS");
+    assert_eq!(instances[0].sections[3].start_page, 6);
+    let s = c.throttling_state().unwrap();
+    assert_eq!(s.images_remaining(), Some(7));
+    assert_eq!(s.endpoints["images"].color, ThrottlingColor::Yellow);
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn fetch_image_inquiry_404_maps_to_not_found() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ok_token("1200"))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&server)
+        .await;
+
+    let c = EpoClient::new(KEY.into(), SECRET.into(), Some(server.uri()));
+    assert!(matches!(
+        c.fetch_image_inquiry("ZZ99").await,
+        Err(EpoError::NotFound)
+    ));
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn fetch_image_page_returns_bytes_and_content_type() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ok_token("1200"))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(
+            "/rest-services/published-data/images/EP/1000000/A1/fullimage",
+        ))
+        .and(query_param("Range", "9"))
+        .and(header("accept", "application/pdf"))
+        .and(header("authorization", "Bearer TOKEN-XYZ"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_raw(b"%PDF-1.4 page nine".to_vec(), "application/pdf"),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let c = EpoClient::new(KEY.into(), SECRET.into(), Some(server.uri()));
+    let page = c
+        .fetch_image_page(
+            "published-data/images/EP/1000000/A1/fullimage",
+            "application/pdf",
+            9,
+            Some(12),
+        )
+        .await
+        .unwrap();
+    assert_eq!(page.content_type, "application/pdf");
+    assert_eq!(page.bytes, b"%PDF-1.4 page nine");
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn fetch_image_page_refuses_bad_requests_before_any_call() {
+    let server = MockServer::start().await;
+    let c = EpoClient::new(KEY.into(), SECRET.into(), Some(server.uri()));
+    let good = "published-data/images/EP/1000000/A1/fullimage";
+    let cases = [
+        (
+            "https://evil.example/published-data/images/EP/1/A1/fullimage",
+            "application/pdf",
+            1,
+            Some(12),
+        ),
+        (
+            "published-data/images/EP/../A1/fullimage",
+            "application/pdf",
+            1,
+            Some(12),
+        ),
+        (good, "image/gif", 1, Some(12)),
+        (good, "application/pdf", 0, Some(12)),
+        (good, "application/pdf", 13, Some(12)),
+    ];
+    for (link, format, page, count) in cases {
+        let err = c
+            .fetch_image_page(link, format, page, count)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, EpoError::InvalidRequest(_)),
+            "{link:?} {format:?} page {page}: expected InvalidRequest, got {err:?}"
+        );
+    }
+    assert!(
+        server.received_requests().await.unwrap().is_empty(),
+        "no request, not even the token, for a refused call"
+    );
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn bad_patent_ids_are_refused_before_any_call() {
+    let server = MockServer::start().await;
+    let c = EpoClient::new(KEY.into(), SECRET.into(), Some(server.uri()));
+    for id in [
+        "",
+        "EP1000000/biblio",
+        "EP1000000?x=1",
+        "../family",
+        "EP 1000000",
+        "EP1000000#",
+    ] {
+        let errors = [
+            c.fetch_biblio(id).await.err(),
+            c.fetch_biblio_with_citations(id).await.err(),
+            c.fetch_citations(id).await.err(),
+            c.fetch_family(id).await.err(),
+            c.fetch_description(id).await.err(),
+            c.fetch_claims(id).await.err(),
+            c.fetch_citing(id, 5).await.err(),
+            c.fetch_image_inquiry(id).await.err(),
+        ];
+        for err in errors {
+            assert!(
+                matches!(err, Some(EpoError::InvalidRequest(_))),
+                "{id:?}: expected InvalidRequest, got {err:?}"
+            );
+        }
+    }
+    assert!(
+        server.received_requests().await.unwrap().is_empty(),
+        "no request, not even the token, for a refused id"
+    );
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn fetch_image_page_fails_past_the_body_cap() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ok_token("1200"))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_raw(vec![0u8; MAX_IMAGE_BYTES + 1], "image/tiff"),
+        )
+        .mount(&server)
+        .await;
+
+    let c = EpoClient::new(KEY.into(), SECRET.into(), Some(server.uri()));
+    let err = c
+        .fetch_image_page(
+            "published-data/images/EP/1000000/A1/fullimage",
+            "image/tiff",
+            1,
+            None,
+        )
+        .await
+        .unwrap_err();
+    let EpoError::Api(msg) = err else {
+        panic!("expected Api error, got {err:?}");
+    };
+    assert!(msg.contains("image body over"), "{msg}");
 }

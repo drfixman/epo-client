@@ -44,6 +44,8 @@
 //! - [`EpoClient::fetch_citing`] — forward citations via CQL search.
 //! - [`EpoClient::fetch_search`] — CQL search with pagination.
 //! - [`EpoClient::fetch_cpc_titles`] — CPC scheme titles for a list of codes, one request per code.
+//! - [`EpoClient::fetch_image_inquiry`] — the image instances of a publication (full document, drawings, first-page clipping), with page counts, formats and sections.
+//! - [`EpoClient::fetch_image_page`] — one page of one image instance, as raw bytes in a stated format.
 //!
 //! All of them return typed [`EpoError`] variants on failure, with retry built in
 //! for `403`/`429`. The token endpoint response is cached and refreshed
@@ -53,7 +55,10 @@
 //!
 //! You need an EPO OPS consumer key + secret from
 //! <https://developers.epo.org>. The free tier limits weekly traffic by bytes;
-//! the client honours the documented 4 req/s pacing internally.
+//! the client paces each endpoint group at EPO's documented per-minute
+//! ceiling (see [`ClientConfig`]).
+
+#![warn(missing_docs)]
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -66,17 +71,36 @@ pub use validator::{CqlError, CqlErrorKind, FIELD_CODES, ValidatedCql, validate 
 
 const DEFAULT_EPO_BASE: &str = "https://ops.epo.org/3.2";
 
+/// Largest image body [`EpoClient::fetch_image_page`] reads: 16 MiB. The
+/// cap bounds the memory one call can take, so a broken or hostile answer
+/// cannot fill memory; 16 MiB leaves room for a large single-page scan.
+/// A body past it fails with [`EpoError::Api`].
+pub const MAX_IMAGE_BYTES: usize = 16 * 1024 * 1024;
+
+/// The formats OPS offers for one image page: the `produces` list of the
+/// images retrieval service in EPO's OPS v3.2 API spec, plus `image/jpeg`,
+/// which live inquiries list for first-page clippings.
+/// [`EpoClient::fetch_image_page`] refuses any other format.
+pub const IMAGE_FORMATS: &[&str] = &[
+    "application/pdf",
+    "application/tiff",
+    "image/jpeg",
+    "image/png",
+    "image/tiff",
+];
+
 /// Errors returned by every [`EpoClient`] method.
 ///
 /// Variants distinguish recoverable failures (`RateLimit` — try again) from
-/// terminal ones (`NotFound`, `Auth`) and from transport noise (`Network`)
-/// vs. server-side anomalies (`Api`).
+/// terminal ones (`NotFound`, `Auth`, `InvalidRequest`) and from transport
+/// noise (`Network`) vs. server-side anomalies (`Api`).
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub enum EpoError {
     /// OAuth2 token endpoint rejected the credentials, or the response was
     /// missing a usable `access_token`. The contained string carries the
-    /// status + body for debugging.
+    /// status + body for debugging. A transport failure on the token
+    /// request is [`Network`](Self::Network), not this.
     Auth(String),
     /// HTTP 404 from a data endpoint — the patent isn't in EPO's index.
     NotFound,
@@ -90,6 +114,10 @@ pub enum EpoError {
     /// Transport failure (DNS, connection refused, TLS, timeout). Contains
     /// the underlying [`reqwest`] error message.
     Network(String),
+    /// The caller's input was refused before any request was sent (an
+    /// image link the inquiry did not give, a format OPS does not offer, a
+    /// page out of range). Contains what was refused.
+    InvalidRequest(String),
 }
 
 impl std::fmt::Display for EpoError {
@@ -100,6 +128,7 @@ impl std::fmt::Display for EpoError {
             EpoError::RateLimit => write!(f, "EPO rate limit exceeded"),
             EpoError::Api(msg) => write!(f, "EPO API error: {msg}"),
             EpoError::Network(msg) => write!(f, "Network error: {msg}"),
+            EpoError::InvalidRequest(msg) => write!(f, "Invalid EPO request: {msg}"),
         }
     }
 }
@@ -346,6 +375,49 @@ pub struct SearchResults {
     pub patents: Vec<SearchResultPatent>,
 }
 
+/// One image instance of a publication, as the OPS images inquiry lists
+/// it. Returned by [`EpoClient::fetch_image_inquiry`].
+#[derive(Debug, Clone, Default, serde::Serialize)]
+#[non_exhaustive]
+pub struct ImageInstance {
+    /// OPS `@desc`, verbatim: `FullDocument`, `Drawing`,
+    /// `FirstPageClipping`, `FirstPageImage`, `JapaneseAbstract`, …
+    pub kind: String,
+    /// OPS `@number-of-pages`. `0` when OPS left it out or sent no number.
+    pub page_count: u32,
+    /// The `document-format` values OPS offers for this instance
+    /// (`application/pdf`, `application/tiff`, `image/png`, …).
+    pub formats: Vec<String>,
+    /// OPS `@link`: the path [`EpoClient::fetch_image_page`] takes
+    /// (`published-data/images/EP/1000000/A1/fullimage`). `None` when OPS
+    /// gave no link; such an instance cannot be fetched.
+    pub link: Option<String>,
+    /// The document sections in this instance, each with its first page
+    /// (`DRAWINGS`, `CLAIMS`, `DESCRIPTION`, …), in the order OPS sent them.
+    pub sections: Vec<ImageSection>,
+}
+
+/// One `document-section` of an [`ImageInstance`].
+#[derive(Debug, Clone, serde::Serialize)]
+#[non_exhaustive]
+pub struct ImageSection {
+    /// OPS `@name` (`DRAWINGS`, `CLAIMS`, `ABSTRACT`, …).
+    pub name: String,
+    /// OPS `@start-page`: the first page (1-based) that holds this section.
+    pub start_page: u32,
+}
+
+/// One page of an image instance. Returned by
+/// [`EpoClient::fetch_image_page`]. The bytes are EPO's, undecoded.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct ImagePage {
+    /// The `Content-Type` EPO sent; the requested format when EPO sent none.
+    pub content_type: String,
+    /// The response body, at most [`MAX_IMAGE_BYTES`] long.
+    pub bytes: Vec<u8>,
+}
+
 struct TokenState {
     access_token: String,
     expires_at: std::time::Instant,
@@ -359,6 +431,11 @@ struct EndpointPacer {
     interval: Duration,
 }
 
+/// The client: one OAuth2 token, one pacer per endpoint group and one
+/// in-flight cap, shared by every `fetch_*` call. Cloning is cheap and
+/// the clones share the token, the pacers and the cap, so one client per
+/// consumer key is the intended shape.
+#[derive(Clone)]
 pub struct EpoClient {
     http: reqwest::Client,
     consumer_key: String,
@@ -370,15 +447,27 @@ pub struct EpoClient {
     throttling: Arc<std::sync::Mutex<Option<ThrottlingState>>>,
     /// Per-endpoint pacers. `inpadoc` covers biblio/family/citations,
     /// `search` covers search/citing, `retrieval` covers description/claims,
-    /// `other` covers the auth + token refresh path.
+    /// `images` covers image inquiry/page, `other` covers the auth + token
+    /// refresh path.
     pacer_inpadoc: Arc<EndpointPacer>,
     pacer_search: Arc<EndpointPacer>,
     pacer_retrieval: Arc<EndpointPacer>,
+    pacer_images: Arc<EndpointPacer>,
     pacer_other: Arc<EndpointPacer>,
     /// Bounds in-flight requests across every endpoint. Built from
     /// [`ClientConfig::max_concurrent`]; the per-endpoint pacers run beneath
     /// it so a small permit count + tight pacers compose without conflict.
     sem: Arc<tokio::sync::Semaphore>,
+}
+
+/// Prints the base URL and the in-flight cap; never the key or secret.
+impl std::fmt::Debug for EpoClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EpoClient")
+            .field("base_url", &self.config.base_url)
+            .field("max_concurrent", &self.config.max_concurrent)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Tunables for [`EpoClient`]. Use [`ClientConfig::default`] for sensible
@@ -409,7 +498,9 @@ pub struct ClientConfig {
     pub search_interval: Duration,
     /// Min interval between calls to *retrieval* endpoints (description,
     /// claims). EPO's documented free-tier ceiling is 100 req/min →
-    /// default 600 ms/call.
+    /// default 600 ms/call. The *images* endpoints (image inquiry, image
+    /// page) have their own pacer and their own `images` quota, paced at
+    /// this same interval.
     pub retrieval_interval: Duration,
     /// Min interval for the *other* category (auth/status). 1000 req/min
     /// → default 60 ms/call. Mostly negligible since the token is cached.
@@ -526,6 +617,12 @@ impl ThrottlingState {
             .get("retrieval")
             .map(|q| q.remaining_per_minute)
     }
+
+    /// Convenience accessor: remaining slots for the `images` endpoint
+    /// group (image inquiry / image page).
+    pub fn images_remaining(&self) -> Option<u32> {
+        self.endpoints.get("images").map(|q| q.remaining_per_minute)
+    }
 }
 
 /// `expires_in` is what EPO reports; subtract `buffer` and clamp to zero so
@@ -535,7 +632,9 @@ fn expires_in_with_buffer(expires_in: u64, buffer: Duration) -> Duration {
 }
 
 /// Compare new throttling state against previous, emit `warn!` on the
-/// transitions worth waking up an operator for.
+/// transitions worth waking up an operator for. A load-level change is
+/// `debug!` only: EPO flips between busy and overloaded every few
+/// seconds, and the per-endpoint colors below say what it means for us.
 fn emit_threshold_warnings(
     prev: Option<&ThrottlingState>,
     new: &ThrottlingState,
@@ -544,7 +643,7 @@ fn emit_threshold_warnings(
     // Load level transition (idle → busy → overloaded → unavailable).
     let prev_load = prev.map(|p| &p.load);
     if prev_load != Some(&new.load) && new.load != ThrottlingLoad::Idle {
-        warn!(load = ?new.load, "EPO server load level changed");
+        debug!(load = ?new.load, "EPO server load level changed");
     }
 
     // Per-endpoint color worsening.
@@ -600,13 +699,13 @@ fn emit_threshold_warnings(
 ///
 /// `hour_used` and `week_used` are filled by the caller from the
 /// `x-individualquotaperhour-used` / `x-registeredquotaperweek-used`
-/// headers. Returns `None` when the header is malformed beyond recognition;
-/// callers treat that as "no update".
+/// headers. Entries that do not parse are skipped; an unknown load word
+/// lands in [`ThrottlingLoad::Other`], so every header gives a state.
 pub(crate) fn parse_throttling_header(
     header: &str,
     hour_used: Option<u64>,
     week_used: Option<u64>,
-) -> Option<ThrottlingState> {
+) -> ThrottlingState {
     let header = header.trim();
     let (load_str, rest) = match header.split_once('(') {
         Some((load, rest)) => (load.trim(), rest.trim_end_matches(')').trim()),
@@ -649,12 +748,12 @@ pub(crate) fn parse_throttling_header(
         );
     }
 
-    Some(ThrottlingState {
+    ThrottlingState {
         load,
         endpoints,
         hour_bytes_used: hour_used,
         week_bytes_used: week_used,
-    })
+    }
 }
 
 impl Default for ClientConfig {
@@ -777,6 +876,7 @@ impl EpoClient {
         let pacer_inpadoc = Arc::new(EndpointPacer::new(config.inpadoc_interval));
         let pacer_search = Arc::new(EndpointPacer::new(config.search_interval));
         let pacer_retrieval = Arc::new(EndpointPacer::new(config.retrieval_interval));
+        let pacer_images = Arc::new(EndpointPacer::new(config.retrieval_interval));
         let pacer_other = Arc::new(EndpointPacer::new(config.other_interval));
         // Zero-permit semaphore would deadlock the first `acquire`; clamp.
         let sem = Arc::new(tokio::sync::Semaphore::new(config.max_concurrent.max(1)));
@@ -790,6 +890,7 @@ impl EpoClient {
             pacer_inpadoc,
             pacer_search,
             pacer_retrieval,
+            pacer_images,
             pacer_other,
             sem,
         }
@@ -826,9 +927,7 @@ impl EpoClient {
         let Some(throttling_str) = header_value else {
             return;
         };
-        let Some(new_state) = parse_throttling_header(throttling_str, hour, week) else {
-            return;
-        };
+        let new_state = parse_throttling_header(throttling_str, hour, week);
 
         let mut g = match self.throttling.lock() {
             Ok(g) => g,
@@ -860,7 +959,7 @@ impl EpoClient {
             .form(&[("grant_type", "client_credentials")])
             .send()
             .await
-            .map_err(|e| EpoError::Auth(e.to_string()))?;
+            .map_err(|e| EpoError::Network(e.to_string()))?;
 
         // EPO sets throttling/quota headers on auth-error responses too —
         // auth counts against the `other` quota — so capture before any
@@ -899,8 +998,15 @@ impl EpoClient {
         Ok(access_token)
     }
 
+    /// Fetch the bibliographic data of a publication: title, abstract,
+    /// parties, dates and classifications ([`PatentBiblio`]). `patent_id`
+    /// is an epodoc number (`EP1000000`, `US2024123456A1`); anything but
+    /// ASCII letters and digits is refused with
+    /// [`EpoError::InvalidRequest`] before a request is sent, as on every
+    /// call that takes a number. Counts against the `inpadoc` quota.
     #[instrument(skip(self), fields(endpoint = "biblio", attempts = field::Empty))]
     pub async fn fetch_biblio(&self, patent_id: &str) -> Result<PatentBiblio, EpoError> {
+        check_patent_id(patent_id)?;
         let _permit = self.sem.acquire().await.expect("EPO semaphore poisoned");
         retry_with_pacer(
             &self.pacer_inpadoc,
@@ -970,6 +1076,7 @@ impl EpoClient {
         &self,
         patent_id: &str,
     ) -> Result<(PatentBiblio, Citations), EpoError> {
+        check_patent_id(patent_id)?;
         let _permit = self.sem.acquire().await.expect("EPO semaphore poisoned");
         let json = retry_with_pacer(
             &self.pacer_inpadoc,
@@ -989,8 +1096,13 @@ impl EpoClient {
         Ok((biblio, citations))
     }
 
+    /// Fetch the backward citations of a publication (the references its
+    /// applicant and examiner cited) from the biblio endpoint; `citing`
+    /// stays empty, see [`fetch_citing`](Self::fetch_citing). Same
+    /// request, quota and number check as [`fetch_biblio`](Self::fetch_biblio).
     #[instrument(skip(self), fields(endpoint = "citations", attempts = field::Empty))]
     pub async fn fetch_citations(&self, patent_id: &str) -> Result<Citations, EpoError> {
+        check_patent_id(patent_id)?;
         let _permit = self.sem.acquire().await.expect("EPO semaphore poisoned");
         let json = retry_with_pacer(
             &self.pacer_inpadoc,
@@ -1013,6 +1125,11 @@ impl EpoClient {
         returned = field::Empty,
         attempts = field::Empty,
     ))]
+    /// Run a CQL query and return one page of hits, `range_begin` to
+    /// `range_end` (1-based, inclusive, at most 100 per page). The query
+    /// goes to EPO as given; [`validate_cql`] checks it first. A 404 is
+    /// an empty [`SearchResults`], not an error. Counts against the
+    /// `search` quota, the tightest one.
     pub async fn fetch_search(
         &self,
         cql: &str,
@@ -1086,8 +1203,14 @@ impl EpoClient {
         Ok(parse_search_results(&json))
     }
 
+    /// Fetch the INPADOC family of a publication: every publication of the
+    /// same invention, one [`FamilyMember`] each, titles empty (EPO does
+    /// not send them; see
+    /// [`enrich_family_titles`](Self::enrich_family_titles)). Same quota
+    /// and number check as [`fetch_biblio`](Self::fetch_biblio).
     #[instrument(skip(self), fields(endpoint = "family", attempts = field::Empty))]
     pub async fn fetch_family(&self, patent_id: &str) -> Result<Vec<FamilyMember>, EpoError> {
+        check_patent_id(patent_id)?;
         let _permit = self.sem.acquire().await.expect("EPO semaphore poisoned");
         retry_with_pacer(
             &self.pacer_inpadoc,
@@ -1154,6 +1277,7 @@ impl EpoClient {
     /// retry-on-403/429 schedule.
     #[instrument(skip(self), fields(endpoint = "description", attempts = field::Empty))]
     pub async fn fetch_description(&self, patent_id: &str) -> Result<PatentDescription, EpoError> {
+        check_patent_id(patent_id)?;
         let _permit = self.sem.acquire().await.expect("EPO semaphore poisoned");
         retry_with_pacer(
             &self.pacer_retrieval,
@@ -1213,6 +1337,7 @@ impl EpoClient {
     /// JSON yourself.
     #[instrument(skip(self), fields(endpoint = "claims", attempts = field::Empty))]
     pub async fn fetch_claims(&self, patent_id: &str) -> Result<PatentClaims, EpoError> {
+        check_patent_id(patent_id)?;
         let _permit = self.sem.acquire().await.expect("EPO semaphore poisoned");
         retry_with_pacer(
             &self.pacer_retrieval,
@@ -1270,6 +1395,7 @@ impl EpoClient {
     /// `max` becomes the upper bound). Realistic ceiling is 100.
     #[instrument(skip(self), fields(endpoint = "citing"))]
     pub async fn fetch_citing(&self, patent_id: &str, max: u32) -> Result<Vec<Citation>, EpoError> {
+        check_patent_id(patent_id)?;
         let cql = format!("ct={patent_id}");
         let results = self.fetch_search(&cql, 1, max.max(1)).await?;
         Ok(results
@@ -1414,6 +1540,312 @@ impl EpoClient {
             return Err(EpoError::Api(format!("{status}: {message}")));
         }
         Ok(xml)
+    }
+
+    /// List the image instances of a published patent: one
+    /// `GET /published-data/publication/epodoc/{patent_id}/images` (XML
+    /// answer), parsed by [`parse_image_inquiry`]. Each instance carries
+    /// its kind, page count, formats, link and sections; the `DRAWINGS`
+    /// section gives the first drawing page.
+    ///
+    /// A publication without images gives an empty list. A publication EPO
+    /// does not know gives [`EpoError::NotFound`].
+    ///
+    /// Counts against EPO's "images" quota (`images` in
+    /// [`ThrottlingState::endpoints`]), separate from retrieval. Paced at
+    /// [`ClientConfig::retrieval_interval`], with the retry-on-403/429
+    /// schedule.
+    #[instrument(skip(self), fields(
+        endpoint = "images",
+        http_status = field::Empty,
+        instances = field::Empty,
+        attempts = field::Empty,
+    ))]
+    pub async fn fetch_image_inquiry(
+        &self,
+        patent_id: &str,
+    ) -> Result<Vec<ImageInstance>, EpoError> {
+        check_patent_id(patent_id)?;
+        let _permit = self.sem.acquire().await.expect("EPO semaphore poisoned");
+        let instances = retry_with_pacer(
+            &self.pacer_images,
+            &self.config.retry_backoff,
+            patent_id,
+            "images",
+            || self.fetch_image_inquiry_once(patent_id),
+        )
+        .await?;
+        Span::current().record("instances", instances.len());
+        Ok(instances)
+    }
+
+    async fn fetch_image_inquiry_once(
+        &self,
+        patent_id: &str,
+    ) -> Result<Vec<ImageInstance>, EpoError> {
+        let token = self.get_token().await?;
+        let url = format!(
+            "{}/rest-services/published-data/publication/epodoc/{patent_id}/images",
+            self.config.base_url
+        );
+        let resp = self
+            .http
+            .get(&url)
+            .header("Accept", "application/xml")
+            .bearer_auth(&token)
+            .send()
+            .await
+            .map_err(|e| EpoError::Network(e.to_string()))?;
+
+        let status = resp.status().as_u16();
+        Span::current().record("http_status", status);
+        self.update_throttling(resp.headers());
+
+        match status {
+            200 => {}
+            404 => return Err(EpoError::NotFound),
+            403 | 429 => return Err(EpoError::RateLimit),
+            other => {
+                let body = resp.text().await.unwrap_or_default();
+                return Err(EpoError::Api(format!("{other}: {body}")));
+            }
+        }
+
+        let xml = resp
+            .text()
+            .await
+            .map_err(|e| EpoError::Api(e.to_string()))?;
+        let doc = roxmltree::Document::parse(&xml)
+            .map_err(|e| EpoError::Api(format!("{status}: answer is not XML: {e}")))?;
+        if let Some(message) = ops_error_message(&doc) {
+            return Err(EpoError::Api(format!("{status}: {message}")));
+        }
+        Ok(image_instances(&doc))
+    }
+
+    /// Fetch one page of one image instance:
+    /// `GET /published-data/images/{country}/{number}/{kind}/{type}?Range={page}`
+    /// with `Accept: {format}`. Returns the bytes and the content type EPO
+    /// sent; nothing is decoded or converted.
+    ///
+    /// Refused with [`EpoError::InvalidRequest`] before any request is sent:
+    /// - a `link` that is not an images path as
+    ///   [`fetch_image_inquiry`](Self::fetch_image_inquiry) gives it
+    ///   (`published-data/images/` and four parts of letters and digits;
+    ///   no absolute URL, scheme, host, `..` or other prefix);
+    /// - a `format` not in [`IMAGE_FORMATS`];
+    /// - page `0` (pages are 1-based), or a page past `page_count` when the
+    ///   caller passes it (pass [`ImageInstance::page_count`]).
+    ///
+    /// A body longer than [`MAX_IMAGE_BYTES`] fails with [`EpoError::Api`].
+    /// Same "images" quota, pacing and retry schedule as
+    /// [`fetch_image_inquiry`](Self::fetch_image_inquiry).
+    #[instrument(skip(self), fields(
+        endpoint = "images",
+        http_status = field::Empty,
+        bytes = field::Empty,
+        attempts = field::Empty,
+    ))]
+    pub async fn fetch_image_page(
+        &self,
+        link: &str,
+        format: &str,
+        page: u32,
+        page_count: Option<u32>,
+    ) -> Result<ImagePage, EpoError> {
+        let path = check_image_request(link, format, page, page_count)?;
+        let _permit = self.sem.acquire().await.expect("EPO semaphore poisoned");
+        let image = retry_with_pacer(
+            &self.pacer_images,
+            &self.config.retry_backoff,
+            path,
+            "images",
+            || self.fetch_image_page_once(path, format, page),
+        )
+        .await?;
+        Span::current().record("bytes", image.bytes.len());
+        Ok(image)
+    }
+
+    async fn fetch_image_page_once(
+        &self,
+        path: &str,
+        format: &str,
+        page: u32,
+    ) -> Result<ImagePage, EpoError> {
+        let token = self.get_token().await?;
+        let url = format!("{}/rest-services/{path}", self.config.base_url);
+        let mut resp = self
+            .http
+            .get(&url)
+            .header("Accept", format)
+            .bearer_auth(&token)
+            .query(&[("Range", page)])
+            .send()
+            .await
+            .map_err(|e| EpoError::Network(e.to_string()))?;
+
+        let status = resp.status().as_u16();
+        Span::current().record("http_status", status);
+        self.update_throttling(resp.headers());
+
+        match status {
+            200 => {}
+            404 => return Err(EpoError::NotFound),
+            403 | 429 => return Err(EpoError::RateLimit),
+            other => {
+                let body = resp.text().await.unwrap_or_default();
+                return Err(EpoError::Api(format!("{other}: {body}")));
+            }
+        }
+
+        let too_large =
+            || EpoError::Api(format!("{status}: image body over {MAX_IMAGE_BYTES} bytes"));
+        if resp
+            .content_length()
+            .is_some_and(|n| n > MAX_IMAGE_BYTES as u64)
+        {
+            return Err(too_large());
+        }
+        let content_type = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or(format)
+            .to_string();
+        let mut bytes = Vec::new();
+        while let Some(chunk) = resp
+            .chunk()
+            .await
+            .map_err(|e| EpoError::Network(e.to_string()))?
+        {
+            if bytes.len() + chunk.len() > MAX_IMAGE_BYTES {
+                return Err(too_large());
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        Ok(ImagePage {
+            content_type,
+            bytes,
+        })
+    }
+}
+
+/// Check an image page request before anything is sent; on success, the
+/// link as a path under `rest-services/` (without a leading `/`).
+fn check_image_request<'a>(
+    link: &'a str,
+    format: &str,
+    page: u32,
+    page_count: Option<u32>,
+) -> Result<&'a str, EpoError> {
+    let Some(path) = image_link_path(link) else {
+        return Err(EpoError::InvalidRequest(format!(
+            "not an OPS images link: {link:?}"
+        )));
+    };
+    if !IMAGE_FORMATS.contains(&format) {
+        return Err(EpoError::InvalidRequest(format!(
+            "format {format:?} is not one of {IMAGE_FORMATS:?}"
+        )));
+    }
+    if page == 0 {
+        return Err(EpoError::InvalidRequest(
+            "page 0: pages start at 1".to_string(),
+        ));
+    }
+    if let Some(count) = page_count
+        && page > count
+    {
+        return Err(EpoError::InvalidRequest(format!(
+            "page {page} is past the instance's {count} pages"
+        )));
+    }
+    Ok(path)
+}
+
+/// `link` as the images inquiry gives it,
+/// `published-data/images/{country}/{number}/{kind}/{type}` (one leading
+/// `/` allowed), each of the four parts only ASCII letters and digits.
+/// `None` for anything else, so only a path under the images service
+/// reaches the URL.
+fn image_link_path(link: &str) -> Option<&str> {
+    let path = link.strip_prefix('/').unwrap_or(link);
+    let parts = path.strip_prefix("published-data/images/")?.split('/');
+    let mut count = 0;
+    for part in parts {
+        if part.is_empty() || !part.chars().all(|c| c.is_ascii_alphanumeric()) {
+            return None;
+        }
+        count += 1;
+    }
+    (count == 4).then_some(path)
+}
+
+/// Every `ops:document-instance` in an images inquiry answer (XML), in the
+/// order OPS sent them. Shape (EPO's `ops.xsd`):
+///
+/// ```text
+/// ops:world-patent-data / ops:document-inquiry / ops:inquiry-result
+///   ops:document-instance  @desc @number-of-pages @link @system
+///     ops:document-format-options / ops:document-format   (text: a MIME type)
+///     ops:document-section  @name @start-page              (zero or more)
+/// ```
+///
+/// An answer without instances, or text that is not XML, gives an empty
+/// list.
+pub fn parse_image_inquiry(xml: &str) -> Vec<ImageInstance> {
+    match roxmltree::Document::parse(xml) {
+        Ok(doc) => image_instances(&doc),
+        Err(_) => Vec::new(),
+    }
+}
+
+fn image_instances(doc: &roxmltree::Document) -> Vec<ImageInstance> {
+    doc.descendants()
+        .filter(|n| n.tag_name().name() == "document-instance")
+        .map(|instance| ImageInstance {
+            kind: instance.attribute("desc").unwrap_or_default().to_string(),
+            page_count: instance
+                .attribute("number-of-pages")
+                .and_then(|p| p.trim().parse().ok())
+                .unwrap_or(0),
+            formats: instance
+                .descendants()
+                .filter(|n| n.tag_name().name() == "document-format")
+                .map(|n| xml_text(n).trim().to_string())
+                .filter(|f| !f.is_empty())
+                .collect(),
+            link: instance
+                .attribute("link")
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .map(str::to_string),
+            sections: instance
+                .children()
+                .filter(|n| n.tag_name().name() == "document-section")
+                .filter_map(|s| {
+                    Some(ImageSection {
+                        name: s.attribute("name")?.to_string(),
+                        start_page: s.attribute("start-page")?.trim().parse().ok()?,
+                    })
+                })
+                .collect(),
+        })
+        .collect()
+}
+
+/// Refuse a publication number that is not ASCII letters and digits
+/// (an epodoc number: `EP1000000`, `US2024123456A1`, `WO2014206532`), so
+/// a caller's input can never add a path segment, a query or a CQL
+/// clause. Fails with [`EpoError::InvalidRequest`].
+fn check_patent_id(patent_id: &str) -> Result<(), EpoError> {
+    if !patent_id.is_empty() && patent_id.chars().all(|c| c.is_ascii_alphanumeric()) {
+        Ok(())
+    } else {
+        Err(EpoError::InvalidRequest(format!(
+            "not a publication number (letters and digits only): {patent_id:?}"
+        )))
     }
 }
 
@@ -2465,6 +2897,131 @@ mod tests {
         assert_eq!(ops_error_message(&scheme), None);
     }
 
+    /// OPS's images inquiry answer for EP1000000, recorded 2026-11-05: two
+    /// publications (B1, A1), three instances each.
+    const IMAGE_INQUIRY_XML: &str = include_str!("../tests/fixtures/images_ep1000000.xml");
+
+    #[test]
+    fn image_inquiry_lists_every_instance_with_its_drawings_section() {
+        let instances = parse_image_inquiry(IMAGE_INQUIRY_XML);
+        assert_eq!(instances.len(), 6);
+
+        let full = &instances[0];
+        assert_eq!(full.kind, "FullDocument");
+        assert_eq!(full.page_count, 11);
+        assert_eq!(full.formats, vec!["application/pdf", "application/tiff"]);
+        assert_eq!(
+            full.link.as_deref(),
+            Some("published-data/images/EP/1000000/B1/fullimage")
+        );
+        let drawings = full
+            .sections
+            .iter()
+            .find(|s| s.name == "DRAWINGS")
+            .expect("DRAWINGS section");
+        assert_eq!(drawings.start_page, 6);
+        assert_eq!(full.sections.len(), 4);
+
+        assert_eq!(instances[1].kind, "Drawing");
+        assert_eq!(instances[1].page_count, 6);
+        assert_eq!(instances[1].sections[0].name, "DRAWINGS");
+        assert_eq!(instances[1].sections[0].start_page, 1);
+        assert_eq!(instances[2].kind, "FirstPageClipping");
+        assert_eq!(
+            instances[2].formats,
+            vec![
+                "application/pdf",
+                "application/tiff",
+                "image/jpeg",
+                "image/png"
+            ]
+        );
+        assert_eq!(instances[2].sections.len(), 2);
+        assert_eq!(
+            instances[3].link.as_deref(),
+            Some("published-data/images/EP/1000000/A1/fullimage")
+        );
+        for i in &instances {
+            assert!(
+                i.formats
+                    .iter()
+                    .all(|f| IMAGE_FORMATS.contains(&f.as_str()))
+            );
+        }
+    }
+
+    /// Hand-written: no recorded answer without images exists. An inquiry
+    /// result with no `document-instance` (the schema allows zero).
+    #[test]
+    fn image_inquiry_without_images_is_an_empty_list() {
+        let xml = r#"<ops:world-patent-data xmlns:ops="http://ops.epo.org" xmlns="http://www.epo.org/exchange">
+          <ops:document-inquiry>
+            <ops:inquiry-result>
+              <publication-reference>
+                <document-id document-id-type="docdb"><country>XX</country><doc-number>1</doc-number><kind>A</kind></document-id>
+              </publication-reference>
+            </ops:inquiry-result>
+          </ops:document-inquiry>
+        </ops:world-patent-data>"#;
+        assert!(parse_image_inquiry(xml).is_empty());
+        assert!(parse_image_inquiry("").is_empty());
+    }
+
+    #[test]
+    fn only_images_links_reach_the_url() {
+        let link = "published-data/images/EP/1000000/A1/fullimage";
+        assert_eq!(image_link_path(link), Some(link));
+        assert_eq!(image_link_path(&format!("/{link}")), Some(link));
+        for bad in [
+            "https://evil.example/published-data/images/EP/1/A1/fullimage",
+            "//evil.example/published-data/images/EP/1/A1/fullimage",
+            "http:published-data/images/EP/1/A1/fullimage",
+            "published-data/images/EP/../A1/fullimage",
+            "published-data/images/EP/1000000/A1/../../publication",
+            "published-data/publication/epodoc/EP1000000/biblio",
+            "rest-services/published-data/images/EP/1/A1/fullimage",
+            "published-data/images/EP/1000000/A1",
+            "published-data/images/EP/1000000/A1/fullimage/extra",
+            "published-data/images/EP/1000000/A1/fullimage?Range=2",
+            "published-data/images/EP/1000000/A1/fullimage#x",
+            "published-data/images/EP//A1/fullimage",
+            "published-data/images/EP/1%2F0/A1/fullimage",
+            "",
+        ] {
+            assert_eq!(image_link_path(bad), None, "{bad:?} must be refused");
+        }
+    }
+
+    #[test]
+    fn image_requests_are_checked_before_sending() {
+        let link = "published-data/images/EP/1000000/A1/fullimage";
+        assert!(check_image_request(link, "application/pdf", 1, Some(12)).is_ok());
+        assert!(check_image_request(link, "image/tiff", 12, Some(12)).is_ok());
+        assert!(check_image_request(link, "image/png", 40, None).is_ok());
+        for (format, page, count) in [
+            ("image/gif", 1, Some(12)),
+            ("application/pdf ", 1, Some(12)),
+            ("application/pdf", 0, Some(12)),
+            ("application/pdf", 13, Some(12)),
+        ] {
+            assert!(
+                matches!(
+                    check_image_request(link, format, page, count),
+                    Err(EpoError::InvalidRequest(_))
+                ),
+                "{format:?} page {page} of {count:?} must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn images_quota_is_read_from_the_throttling_header() {
+        let header = "busy (images=green:100, inpadoc=green:45, other=green:1000, retrieval=green:100, search=green:15)";
+        let s = parse_throttling_header(header, None, None);
+        assert_eq!(s.images_remaining(), Some(100));
+        assert_eq!(s.endpoints["images"].color, ThrottlingColor::Green);
+    }
+
     #[test]
     fn cpc_symbols_compare_without_spaces_or_case() {
         assert_eq!(normalize_cpc_symbol(" h01m 10/6556 "), "H01M10/6556");
@@ -3207,8 +3764,7 @@ mod tests {
             "idle (images=green:200, inpadoc=green:60, retrieval=green:200, search=green:30)",
             None,
             None,
-        )
-        .unwrap();
+        );
         assert_eq!(s.load, ThrottlingLoad::Idle);
         assert_eq!(s.endpoints["search"].remaining_per_minute, 30);
         assert_eq!(s.endpoints["search"].color, ThrottlingColor::Green);
@@ -3219,7 +3775,7 @@ mod tests {
     fn test_parse_throttling_busy_real_shape() {
         // Verbatim from a real EPO biblio response.
         let header = "busy (images=green:100, inpadoc=green:45, other=green:1000, retrieval=green:100, search=green:15)";
-        let s = parse_throttling_header(header, Some(20360), Some(1427448)).unwrap();
+        let s = parse_throttling_header(header, Some(20360), Some(1427448));
         assert_eq!(s.load, ThrottlingLoad::Busy);
         assert_eq!(s.inpadoc_remaining(), Some(45));
         assert_eq!(s.search_remaining(), Some(15));
@@ -3234,8 +3790,7 @@ mod tests {
             "overloaded (search=yellow:5, retrieval=red:1, images=black:0)",
             None,
             None,
-        )
-        .unwrap();
+        );
         assert_eq!(s.load, ThrottlingLoad::Overloaded);
         assert_eq!(s.endpoints["search"].color, ThrottlingColor::Yellow);
         assert_eq!(s.endpoints["retrieval"].color, ThrottlingColor::Red);
@@ -3246,13 +3801,13 @@ mod tests {
     #[test]
     fn test_parse_throttling_zero_remaining_treated_as_exhausted() {
         // remaining=0 even with green color is effectively exhausted.
-        let s = parse_throttling_header("idle (search=green:0)", None, None).unwrap();
+        let s = parse_throttling_header("idle (search=green:0)", None, None);
         assert!(s.is_exhausted());
     }
 
     #[test]
     fn test_parse_throttling_unknown_load_preserves_endpoints() {
-        let s = parse_throttling_header("weird_state (inpadoc=green:45)", None, None).unwrap();
+        let s = parse_throttling_header("weird_state (inpadoc=green:45)", None, None);
         assert_eq!(
             s.load,
             ThrottlingLoad::Other("weird_state".to_string()),
@@ -3268,8 +3823,7 @@ mod tests {
             "idle (inpadoc=green:45, malformed-entry, search=:notanumber)",
             None,
             None,
-        )
-        .unwrap();
+        );
         assert_eq!(s.endpoints.len(), 1);
         assert_eq!(s.inpadoc_remaining(), Some(45));
     }
